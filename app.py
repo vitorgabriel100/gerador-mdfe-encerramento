@@ -9,7 +9,6 @@ import streamlit as st
 
 
 FUSO_BR = timezone(timedelta(hours=-3))
-NS = {"mdfe": "http://www.portalfiscal.inf.br/mdfe"}
 
 
 def limpar_numeros(texto: str) -> str:
@@ -44,59 +43,61 @@ def gerar_nome_arquivo(chave: str, tipo_evento: str) -> str:
     return f"env_{chave}{tipo_evento}-ped-evt.xml"
 
 
-def extrair_dados_do_xml_processado(xml_bytes: bytes, exigir_cmun: bool = True) -> dict:
+def nome_tag(elem: ET.Element) -> str:
+    if "}" in elem.tag:
+        return elem.tag.split("}", 1)[1]
+    return elem.tag
+
+
+def buscar_primeiro_texto(root: ET.Element, tag: str) -> str:
+    for elem in root.iter():
+        if nome_tag(elem) == tag and elem.text:
+            return elem.text.strip()
+    return ""
+
+
+def extrair_chave_mdfe(root: ET.Element) -> str:
+    chave = limpar_numeros(buscar_primeiro_texto(root, "chMDFe"))
+
+    if validar_chave_mdfe(chave):
+        return chave
+
+    for elem in root.iter():
+        id_attr = elem.attrib.get("Id", "")
+
+        # Exemplo: Id="MDFe352605..."
+        match_mdfe = re.search(r"MDFe(\d{44})", id_attr)
+        if match_mdfe:
+            return match_mdfe.group(1)
+
+        # Exemplo: Id="ID110111352605...01"
+        match_evento = re.search(r"ID\d{6}(\d{44})\d{2}", id_attr)
+        if match_evento:
+            return match_evento.group(1)
+
+    return ""
+
+
+def extrair_dados_do_xml(xml_bytes: bytes) -> dict:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as e:
         raise ValueError(f"XML inválido: {e}")
 
-    chave = limpar_numeros(
-        root.findtext(".//mdfe:protMDFe/mdfe:infProt/mdfe:chMDFe", default="", namespaces=NS)
-    )
+    chave = extrair_chave_mdfe(root)
 
-    if not chave:
-        inf_mdfe = root.find(".//mdfe:infMDFe", NS)
-        if inf_mdfe is not None:
-            id_attr = inf_mdfe.attrib.get("Id", "")
-            chave = limpar_numeros(id_attr.replace("MDFe", ""))
+    protocolo = limpar_numeros(buscar_primeiro_texto(root, "nProt"))
+    cnpj = limpar_numeros(buscar_primeiro_texto(root, "CNPJ"))
+    cuf = limpar_numeros(buscar_primeiro_texto(root, "cUF"))
+    cmun = limpar_numeros(buscar_primeiro_texto(root, "cMun"))
 
-    if not validar_chave_mdfe(chave):
-        raise ValueError("Não foi possível extrair uma chave válida de 44 dígitos do XML processado.")
+    # Fallback usando a própria chave.
+    if validar_chave_mdfe(chave):
+        if not cuf:
+            cuf = chave[:2]
 
-    protocolo = limpar_numeros(
-        root.findtext(".//mdfe:protMDFe/mdfe:infProt/mdfe:nProt", default="", namespaces=NS)
-    )
-
-    cnpj = limpar_numeros(
-        root.findtext(".//mdfe:emit/mdfe:CNPJ", default="", namespaces=NS)
-    )
-
-    cuf = limpar_numeros(
-        root.findtext(".//mdfe:ide/mdfe:cUF", default="", namespaces=NS)
-    )
-
-    cmun = limpar_numeros(
-        root.findtext(".//mdfe:emit/mdfe:enderEmit/mdfe:cMun", default="", namespaces=NS)
-    )
-
-    # Fallback pela própria chave, caso algum campo não venha no XML.
-    if not cuf:
-        cuf = chave[:2]
-
-    if not cnpj:
-        cnpj = chave[6:20]
-
-    if not validar_protocolo(protocolo):
-        raise ValueError("Não foi possível extrair um protocolo válido do XML processado.")
-
-    if len(cnpj) != 14:
-        raise ValueError("Não foi possível extrair um CNPJ válido do XML processado.")
-
-    if len(cuf) != 2:
-        raise ValueError("Não foi possível extrair um cUF válido do XML processado.")
-
-    if exigir_cmun and len(cmun) != 7:
-        raise ValueError("Não foi possível extrair um cMun válido do XML processado.")
+        if not cnpj:
+            cnpj = chave[6:20]
 
     return {
         "chave": chave,
@@ -105,6 +106,37 @@ def extrair_dados_do_xml_processado(xml_bytes: bytes, exigir_cmun: bool = True) 
         "cuf": cuf,
         "cmun": cmun,
     }
+
+
+def validar_dados_encerramento(dados: dict) -> None:
+    if not validar_chave_mdfe(dados["chave"]):
+        raise ValueError("Não foi possível encontrar uma chave MDF-e válida com 44 dígitos.")
+
+    if not validar_protocolo(dados["protocolo"]):
+        raise ValueError("Não foi possível encontrar um protocolo válido no XML.")
+
+    if len(dados["cnpj"]) != 14:
+        raise ValueError("Não foi possível encontrar um CNPJ válido no XML.")
+
+    if len(dados["cuf"]) != 2:
+        raise ValueError("Não foi possível encontrar um cUF válido no XML.")
+
+    if len(dados["cmun"]) != 7:
+        raise ValueError("Não foi possível encontrar um cMun válido no XML.")
+
+
+def validar_dados_cancelamento(dados: dict) -> None:
+    if not validar_chave_mdfe(dados["chave"]):
+        raise ValueError("Informe uma chave MDF-e válida com 44 dígitos.")
+
+    if not validar_protocolo(dados["protocolo"]):
+        raise ValueError("Informe um nProt válido.")
+
+    if len(dados["cnpj"]) != 14:
+        raise ValueError("Informe um CNPJ válido com 14 dígitos.")
+
+    if len(dados["cuf"]) != 2:
+        raise ValueError("Informe um cUF / cOrgao válido com 2 dígitos.")
 
 
 def montar_xml_encerramento(
@@ -175,7 +207,7 @@ def mostrar_resultado(
 ) -> None:
     st.success("XML gerado com sucesso.")
 
-    st.subheader("Dados extraídos")
+    st.subheader("Dados utilizados")
     st.write(f"**Chave:** `{dados['chave']}`")
     st.write(f"**Protocolo:** `{dados['protocolo']}`")
     st.write(f"**CNPJ:** `{dados['cnpj']}`")
@@ -198,29 +230,28 @@ def mostrar_resultado(
     )
 
 
-def aba_encerramento() -> None:
-    st.subheader("Gerador de XML de Encerramento")
-    st.write(
-        "Envie o XML Documento processado do MDF-e. "
-        "O sistema extrai automaticamente chave, protocolo, CNPJ, cUF e cMun."
+def tela_encerramento() -> None:
+    st.subheader("XML de Encerramento")
+
+    st.info(
+        "Para gerar o encerramento, envie o XML do MDF-e com protocolo. "
+        "O sistema tentará extrair automaticamente chave, protocolo, CNPJ, cUF e cMun."
     )
 
     xml_file = st.file_uploader(
-        "Documento processado do MDF-e (.xml)",
+        "Envie o XML do MDF-e",
         type=["xml"],
         key="xml_encerramento"
     )
 
-    if st.button("Gerar XML de Encerramento", use_container_width=True, key="btn_encerramento"):
+    if st.button("Gerar XML de Encerramento", use_container_width=True):
         if xml_file is None:
-            st.error("Envie o XML Documento processado.")
+            st.error("Envie o XML do MDF-e para gerar o encerramento.")
             return
 
         try:
-            dados = extrair_dados_do_xml_processado(
-                xml_file.read(),
-                exigir_cmun=True
-            )
+            dados = extrair_dados_do_xml(xml_file.getvalue())
+            validar_dados_encerramento(dados)
         except Exception as e:
             st.error(str(e))
             return
@@ -246,40 +277,95 @@ def aba_encerramento() -> None:
         )
 
 
-def aba_cancelamento() -> None:
-    st.subheader("Gerador de XML de Cancelamento")
-    st.write(
-        "Envie o XML Documento processado do MDF-e. "
-        "O sistema extrai automaticamente chave, protocolo, CNPJ e cUF."
+def tela_cancelamento() -> None:
+    st.subheader("XML de Cancelamento")
+
+    st.info(
+        "Para gerar o cancelamento, você pode enviar o XML do MDF-e ou preencher os dados manualmente. "
+        "O XML não precisa obrigatoriamente ser processado. Se algum dado não vier no XML, preencha abaixo."
     )
 
     xml_file = st.file_uploader(
-        "Documento processado do MDF-e (.xml)",
+        "Envie o XML do MDF-e, se tiver",
         type=["xml"],
         key="xml_cancelamento"
     )
 
+    dados_xml = {
+        "chave": "",
+        "protocolo": "",
+        "cnpj": "",
+        "cuf": "",
+        "cmun": "",
+    }
+
+    if xml_file is not None:
+        try:
+            dados_xml = extrair_dados_do_xml(xml_file.getvalue())
+            st.success("XML lido com sucesso. Confira ou complete os dados abaixo.")
+        except Exception as e:
+            st.error(str(e))
+            return
+
+    st.markdown("### Dados para o cancelamento")
+
+    chave_manual = st.text_input(
+        "Chave do MDF-e",
+        value=dados_xml["chave"],
+        placeholder="44 dígitos"
+    )
+
+    protocolo_manual = st.text_input(
+        "nProt / Protocolo",
+        value=dados_xml["protocolo"],
+        placeholder="Informe o protocolo do MDF-e"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        cnpj_manual = st.text_input(
+            "CNPJ do emitente",
+            value=dados_xml["cnpj"],
+            placeholder="14 dígitos"
+        )
+
+    with col2:
+        cuf_manual = st.text_input(
+            "cUF / cOrgao",
+            value=dados_xml["cuf"],
+            placeholder="Exemplo: 35"
+        )
+
     justificativa = st.text_area(
         "Justificativa do cancelamento",
         value="Informacoes erradas",
-        height=100,
-        key="justificativa_cancelamento"
+        height=100
     )
 
-    if st.button("Gerar XML de Cancelamento", use_container_width=True, key="btn_cancelamento"):
-        if xml_file is None:
-            st.error("Envie o XML Documento processado.")
-            return
+    if st.button("Gerar XML de Cancelamento", use_container_width=True):
+        dados = {
+            "chave": limpar_numeros(chave_manual),
+            "protocolo": limpar_numeros(protocolo_manual),
+            "cnpj": limpar_numeros(cnpj_manual),
+            "cuf": limpar_numeros(cuf_manual),
+            "cmun": "",
+        }
+
+        # Se a chave foi informada, usa ela para completar cUF e CNPJ quando possível.
+        if validar_chave_mdfe(dados["chave"]):
+            if not dados["cuf"]:
+                dados["cuf"] = dados["chave"][:2]
+
+            if not dados["cnpj"]:
+                dados["cnpj"] = dados["chave"][6:20]
 
         if not justificativa.strip():
             st.error("Informe a justificativa do cancelamento.")
             return
 
         try:
-            dados = extrair_dados_do_xml_processado(
-                xml_file.read(),
-                exigir_cmun=False
-            )
+            validar_dados_cancelamento(dados)
         except Exception as e:
             st.error(str(e))
             return
@@ -312,15 +398,27 @@ def main() -> None:
     )
 
     st.title("Gerador de XML MDF-e")
-    st.write("Gere XML de encerramento ou cancelamento a partir do XML Documento processado.")
 
-    aba1, aba2 = st.tabs(["Encerramento", "Cancelamento"])
+    st.write(
+        "Ferramenta para gerar XML de eventos MDF-e. "
+        "Escolha abaixo se deseja gerar um evento de encerramento ou cancelamento."
+    )
 
-    with aba1:
-        aba_encerramento()
+    tipo_evento = st.selectbox(
+        "Qual evento deseja gerar?",
+        [
+            "Encerramento",
+            "Cancelamento"
+        ]
+    )
 
-    with aba2:
-        aba_cancelamento()
+    st.divider()
+
+    if tipo_evento == "Encerramento":
+        tela_encerramento()
+
+    if tipo_evento == "Cancelamento":
+        tela_cancelamento()
 
 
 if __name__ == "__main__":
