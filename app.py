@@ -391,34 +391,174 @@ def tela_cancelamento() -> None:
         )
 
 
+MOTIVOS_INSUCESSO = {
+    "1": "Recebedor não encontrado",
+    "2": "Recusa",
+    "3": "Endereço inexistente",
+    "4": "Outros",
+}
+
+
+def montar_xml_insucesso(
+    chave: str,
+    cnpj: str,
+    motivo: str,
+    justificativa: str,
+    instante: datetime,
+    tentativa: datetime,
+) -> str:
+    """Gera o pedido conforme o modelo informado, sem assinatura ou envio."""
+    if not re.fullmatch(r"[0-9]{44}", chave):
+        raise ValueError("Informe uma chave CT-e com 44 dígitos.")
+    if chave[20:22] != "57":
+        raise ValueError("A chave deve pertencer a um CT-e (modelo 57).")
+    if not re.fullmatch(r"[0-9]{14}", cnpj):
+        raise ValueError("Informe um CNPJ com 14 dígitos.")
+    if motivo not in MOTIVOS_INSUCESSO:
+        raise ValueError("Selecione um motivo de 1 a 4.")
+    justificativa = justificativa.strip()
+    if not 15 <= len(justificativa) <= 256:
+        raise ValueError("A justificativa deve ter de 15 a 256 caracteres.")
+    if any(
+        not (c in "\t\n\r" or 0x20 <= ord(c) <= 0xD7FF
+             or 0xE000 <= ord(c) <= 0xFFFD or 0x10000 <= ord(c) <= 0x10FFFF)
+        for c in justificativa
+    ):
+        raise ValueError("A justificativa contém caracteres inválidos para XML.")
+    if instante.utcoffset() is None or tentativa.utcoffset() is None:
+        raise ValueError("As datas devem incluir o fuso horário.")
+    if tentativa > instante:
+        raise ValueError("A tentativa de entrega não pode ser posterior ao evento.")
+
+    # Mantém os valores fixos e a sequência de três dígitos do modelo de CT-e.
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<eventoCTe versao="4.00">
+  <infEvento Id="ID110190{chave}001">
+    <cOrgao>35</cOrgao>
+    <tpAmb>1</tpAmb>
+    <CNPJ>{cnpj}</CNPJ>
+    <chCTe>{chave}</chCTe>
+    <dhEvento>{gerar_dh_evento(instante.astimezone(FUSO_BR))}</dhEvento>
+    <tpEvento>110190</tpEvento>
+    <nSeqEvento>001</nSeqEvento>
+    <detEvento versaoEvento="4.00">
+      <evInsucessoEntregaCTe>
+        <descEvento>Insucesso na Entrega do CT-e</descEvento>
+        <tpMotivo>{motivo}</tpMotivo>
+        <xJust>{escape(justificativa)}</xJust>
+        <dhTentativaEntrega>{gerar_dh_evento(tentativa.astimezone(FUSO_BR))}</dhTentativaEntrega>
+      </evInsucessoEntregaCTe>
+    </detEvento>
+  </infEvento>
+</eventoCTe>'''
+
+
+def tela_insucesso() -> None:
+    st.subheader("Insucesso na Entrega do CT-e")
+    st.info("Informe os dados da tentativa de entrega. As datas usam o fuso -03:00.")
+    st.caption("Padrão do modelo: órgão 35 · produção · sequência 001.")
+    if "ins_agora" not in st.session_state:
+        st.session_state["ins_agora"] = gerar_instante_evento().replace(microsecond=0)
+    agora = st.session_state["ins_agora"]
+    chave_texto = st.text_input(
+        "Chave do CT-e", placeholder="44 dígitos", key="ins_chave"
+    )
+    chave = re.sub(r"\s", "", chave_texto)
+    usar_cnpj_chave = st.checkbox(
+        "Usar CNPJ do emitente da chave", value=True, key="ins_usar_cnpj"
+    )
+    if usar_cnpj_chave:
+        cnpj = chave[6:20] if re.fullmatch(r"[0-9]{44}", chave) else ""
+        st.write(f"**CNPJ:** {cnpj or 'Preencha a chave do CT-e.'}")
+    else:
+        cnpj = st.text_input("CNPJ do autor do evento", key="ins_cnpj")
+        cnpj = re.sub(r"[./\s-]", "", cnpj)
+    motivo = st.selectbox(
+        "Motivo do insucesso", list(MOTIVOS_INSUCESSO),
+        format_func=lambda codigo: f"{codigo} — {MOTIVOS_INSUCESSO[codigo]}",
+        key="ins_motivo",
+    )
+    justificativa = st.text_area(
+        "Justificativa do insucesso", max_chars=256,
+        help="Explique o motivo com 15 a 256 caracteres.", key="ins_justificativa",
+    )
+    st.caption(f"{len(justificativa.strip())}/256 caracteres (mínimo 15).")
+    col1, col2 = st.columns(2)
+    with col1:
+        data_evento = st.date_input("Data do evento", value=agora.date(), key="ins_data_evento")
+        hora_evento_texto = st.text_input(
+            "Hora do evento (HH:MM:SS)", value=agora.strftime("%H:%M:%S"),
+            key="ins_hora_evento",
+        )
+    with col2:
+        data_tentativa = st.date_input(
+            "Data da tentativa de entrega", value=agora.date(), key="ins_data_tentativa"
+        )
+        hora_tentativa_texto = st.text_input(
+            "Hora da tentativa de entrega (HH:MM:SS)", value=agora.strftime("%H:%M:%S"),
+            key="ins_hora_tentativa",
+        )
+    try:
+        hora_evento = datetime.strptime(hora_evento_texto, "%H:%M:%S").time()
+        hora_tentativa = datetime.strptime(hora_tentativa_texto, "%H:%M:%S").time()
+    except ValueError:
+        st.session_state.pop("ins_resultado", None)
+        st.error("Informe as horas no formato HH:MM:SS, por exemplo 18:15:00.")
+        return
+    instante = datetime.combine(data_evento, hora_evento, tzinfo=FUSO_BR)
+    tentativa = datetime.combine(data_tentativa, hora_tentativa, tzinfo=FUSO_BR)
+    entradas = (chave, cnpj, motivo, justificativa, instante, tentativa)
+    # Não oferece para download um XML antigo depois de alterar o formulário.
+    if st.session_state.get("ins_entradas") != entradas:
+        st.session_state.pop("ins_resultado", None)
+    if st.button("Gerar XML de Insucesso", key="ins_gerar", use_container_width=True):
+        try:
+            xml_final = montar_xml_insucesso(*entradas)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["ins_entradas"] = entradas
+            st.session_state["ins_resultado"] = xml_final
+    if "ins_resultado" in st.session_state:
+        xml_final = st.session_state["ins_resultado"]
+        nome_arquivo = gerar_nome_arquivo(chave, "ins")
+        st.success("XML de insucesso gerado com sucesso.")
+        st.write(f"**Arquivo:** `{nome_arquivo}`")
+        st.code(xml_final, language="xml")
+        st.download_button(
+            "Baixar XML de Insucesso", data=xml_final.encode("utf-8"),
+            file_name=nome_arquivo, mime="application/xml",
+            key="ins_download", use_container_width=True,
+        )
+
+
 def main() -> None:
     st.set_page_config(
-        page_title="Gerador XML MDF-e",
+        page_title="Gerador XML MDF-e e CT-e",
         layout="centered"
     )
 
-    st.title("Gerador de XML MDF-e")
+    st.title("Gerador de XML MDF-e e CT-e")
 
     st.write(
-        "Ferramenta para gerar XML de eventos MDF-e. "
-        "Escolha abaixo se deseja gerar um evento de encerramento ou cancelamento."
+        "Gere eventos de encerramento e cancelamento de MDF-e "
+        "ou de insucesso na entrega de CT-e."
     )
 
-    tipo_evento = st.selectbox(
-        "Qual evento deseja gerar?",
-        [
-            "Encerramento",
-            "Cancelamento"
-        ]
+    encerramento, cancelamento, insucesso = st.tabs(
+        ["Encerramento MDF-e", "Cancelamento MDF-e", "Insucesso CT-e"]
     )
 
     st.divider()
 
-    if tipo_evento == "Encerramento":
+    with encerramento:
         tela_encerramento()
 
-    if tipo_evento == "Cancelamento":
+    with cancelamento:
         tela_cancelamento()
+
+    with insucesso:
+        tela_insucesso()
 
 
 if __name__ == "__main__":
